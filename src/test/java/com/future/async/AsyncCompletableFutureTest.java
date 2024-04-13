@@ -5,7 +5,6 @@ import com.future.async.domain.dto.OrderResponse;
 import com.future.async.domain.dto.PushMessageResultDTO;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.ObjectUtils;
-import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.RandomUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.jupiter.api.DisplayName;
@@ -13,16 +12,16 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.springframework.scripting.support.ScriptFactoryPostProcessor;
 import org.springframework.test.context.junit.jupiter.SpringExtension;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+
+
 
 @ExtendWith(SpringExtension.class)
 @Slf4j
@@ -38,7 +37,7 @@ class AsyncCompletableFutureTest {
 
 		//order 목록 생성
 		CompletableFuture.runAsync(() -> createOrderList(orderCnt));
-		var future = CompletableFuture.runAsync(() -> createOrderList(orderCnt));
+		CompletableFuture<Void> future = CompletableFuture.runAsync(() -> createOrderList(orderCnt));
 
 		//CompletableFuture는 ForkJoinPool.CommonPool()를 사용하는데 여기서 생성된 Thread는 데몬스레드이기에 확인을 위한 get처리
 		//future가 없을 경우 설명
@@ -58,11 +57,38 @@ class AsyncCompletableFutureTest {
 
 		//CompletableFuture block 은 위 비동기 처리를 기다
 		CompletableFuture<Integer> block = CompletableFuture.supplyAsync(() -> finishConfirmOrder(orderCnt, confirmOrderList));
-		System.out.println(block.get());
+		log(String.valueOf(block.get()));
+	}
+
+	@DisplayName("CompletableFuture 주문 확정 - Processing Time 측정")
+	@Test
+	void completableFutureOrderConfirm_Checklatency() throws ExecutionException, InterruptedException {
+
+		List<String> confirmOrderList = new ArrayList<>();
+		log("START 순차 처리");
+		//주문 목록에 따른 confirm 처리
+		for(OrderDTO order : createOrderList(orderCnt)) {
+			CompletableFuture.supplyAsync(() -> sendOrderDelay(order))
+					.thenAccept(res -> simpleConfirmOrder(confirmOrderList, res.getOrderId()))
+					.get();
+		}
+		log("End 순차 처리");
+		confirmOrderList.clear();
+
+		log("START 비동기 처리");
+		for(OrderDTO order : createOrderList(orderCnt)) {
+			CompletableFuture.supplyAsync(() -> sendOrderDelay(order))
+					.thenAccept(res -> simpleConfirmOrder(confirmOrderList, res.getOrderId()));
+		}
+
+		//CompletableFuture block 은 위 비동기 처리를 기다
+		CompletableFuture<Integer> block = CompletableFuture.supplyAsync(() -> finishConfirmOrder(orderCnt, confirmOrderList));
+		log(String.valueOf(block.get()));
+		log("END 비동기 처리");
 	}
 
 	private String simpleConfirmOrder(List<String> confirmOrderList, String orderId) {
-		log("Confirm Complele Order : OrderId = %s", orderId);
+		log(String.format("Confirm Complele Order : OrderId = %s", orderId));
 		confirmOrderList.add(orderId);
 		return orderId;
 	}
@@ -103,11 +129,11 @@ class AsyncCompletableFutureTest {
 		AtomicInteger retry = new AtomicInteger();
 		//푸시 메세지를 3회 전송에 대한 결과를 전송.
 		while (!result) {
-			retry.getAndIncrement();
+			int retryCnt = retry.getAndIncrement();
 			//푸시 메세지 전송 및 결과 반환
 			result = sendPushMessage(orderId);
-			log(String.format(" SendPushMessage thread name orderId = %s, result = %b", orderId, result));
-			if(retry.get() >= 3) {
+			log(String.format("sendPushMessage thread name orderId = %s, result = %b", orderId, result));
+			if(retryCnt >= 3) {
 				break;
 			}
 			try {
@@ -133,12 +159,18 @@ class AsyncCompletableFutureTest {
 
 	@DisplayName("CompletableFuture Compose 주문 생성 및 주문 확정")
 	@Test
-	void completableFuture_ComposeCreateOrderAndConfirmOrder() throws ExecutionException, InterruptedException, TimeoutException {
+	void completableFuture_ComposeCreateOrderAndConfirmOrder() throws ExecutionException, InterruptedException {
+
+
 
 		var future = CompletableFuture.supplyAsync(() -> createOrder())
 				.thenCompose(order -> CompletableFuture.supplyAsync(() -> confirmOrder(order)));
 
+		var futureThenComposeAsync = CompletableFuture.supplyAsync(() -> createOrder())
+				.thenComposeAsync(order -> CompletableFuture.supplyAsync(() -> confirmOrder(order), executorService));
+
 		log(future.get());
+		log(futureThenComposeAsync.get());
 	}
 
 	/**
@@ -148,12 +180,13 @@ class AsyncCompletableFutureTest {
 	 */
 	private OrderResponse sendOrder(OrderDTO order) {
 		boolean success = true;
+		log(String.format("Send Order : OrderId = %s", order.orderId()));
 		return OrderResponse.builder().success(success).orderId(success ? order.orderId() : null).build();
 	}
 
 	private String confirmOrder(OrderDTO order) {
 		var res = this.sendOrder(order);
-		log(" confirmOrder thread name success = %s", res.getSuccess().toString());
+		log(String.format("confirmOrder thread name success = %s", res.getSuccess().toString()));
 		//성공 여부에 따른 confirm 처리.
 		if(ObjectUtils.isNotEmpty(res) && StringUtils.equals(order.orderId(), res.getOrderId())) {
 			return res.getOrderId();
@@ -161,9 +194,21 @@ class AsyncCompletableFutureTest {
 		return StringUtils.EMPTY;
 	}
 
+	private OrderResponse sendOrderDelay(OrderDTO order) {
+		boolean success = true;
+		log(String.format("Send Order : OrderId = %s", order.orderId()));
+		//처리시간을 sleep으로 구현
+		try {
+			Thread.sleep(50);
+		} catch (InterruptedException e) {
+			throw new RuntimeException(e);
+		}
+		return OrderResponse.builder().success(success).orderId(success ? order.orderId() : null).build();
+	}
+
 	@DisplayName("CompletableFuture 주문 및 배송지 조회")
 	@Test
-	void completableFutureOrderConfirm_CombineOrderAndShippingInfo() throws ExecutionException, InterruptedException, TimeoutException {
+	void completableFuture_CombineOrderItemAndShippingInfo() throws ExecutionException, InterruptedException {
 
 		OrderDTO order = createOrder();
 		//주문 목록에 따른 confirm 처리
@@ -176,7 +221,7 @@ class AsyncCompletableFutureTest {
 
 	private OrderDTO createOrder() {
 		String orderId = String.format("OD-%d", RandomUtils.nextInt());
-		log("Create Order = %s", orderId);
+		log(String.format("Create Order = %s", orderId));
 		return new OrderDTO(orderId, "READY", "ITEM", "ADDRESS", 1);
 	}
 
@@ -186,7 +231,7 @@ class AsyncCompletableFutureTest {
 		} catch (InterruptedException e) {
 			throw new RuntimeException(e);
 		}
-		log("getItemInfo = %s ", itemId);
+		log(String.format("getItemInfo = %s ", itemId));
 		return itemId;
 	}
 
@@ -196,7 +241,7 @@ class AsyncCompletableFutureTest {
 		} catch (InterruptedException e) {
 			throw new RuntimeException(e);
 		}
-		log("getShippingInfo = %s ", address);
+		log(String.format("getShippingInfo = %s ", address));
 		return address;
 	}
 
@@ -209,10 +254,9 @@ class AsyncCompletableFutureTest {
 
 	@DisplayName("CompletableFuture 주문 목록 일괄 확정")
 	@Test
-	void completableFuture_AllOfOrderConfirm() throws ExecutionException, InterruptedException, TimeoutException {
+	void completableFuture_AllOfOrderConfirm() throws ExecutionException, InterruptedException {
 
 		final int confirmTime = 100;
-
 		List<CompletableFuture<String>> futureList = new ArrayList<>();
 		//주문 목록에 따른 confirm 처리
 		for(OrderDTO order : createOrderList(orderCnt)) {
@@ -228,7 +272,7 @@ class AsyncCompletableFutureTest {
 
 	@DisplayName("CompletableFuture 주문 목록 빠른 확정")
 	@Test
-	void completableFuture_AnyOfOrderConfirm() throws ExecutionException, InterruptedException, TimeoutException {
+	void completableFuture_AnyOfOrderConfirm() throws ExecutionException, InterruptedException {
 
 		final int confirmTime = 100;
 
@@ -250,7 +294,7 @@ class AsyncCompletableFutureTest {
 		} catch (InterruptedException e) {
 			throw new RuntimeException(e);
 		}
-		log(" confirmOrder orderId = %s", orderId);
+		log(String.format("confirmOrder orderId = %s", orderId));
 		return orderId;
 	}
 
@@ -268,13 +312,14 @@ class AsyncCompletableFutureTest {
 		log(future.get());
 	}
 
-	@DisplayName("CompletableFuture 에러 헨들링")
+	@DisplayName("CompletableFuture 에러 예외 헨들링")
 	@ParameterizedTest
 	@ValueSource(booleans = {true, false})
 	void completableFuture_ErrorExceptionally(boolean param) throws ExecutionException, InterruptedException{
 
 		var future = CompletableFuture.supplyAsync(() -> createOrder()).thenApply(order -> {
 			if(param) {
+
 				throw new IllegalArgumentException("throw Illegal Exception");
 			}
 			return order.orderId();
@@ -288,14 +333,9 @@ class AsyncCompletableFutureTest {
 			String orderId = String.format("OD-%d", i);
 			orderList.add(new OrderDTO(orderId, "READY"
 					, String.format("ITEM-%s", i), String.format("addr %s", i),1));
-			log("Create Order = %s", orderId);
+			log(String.format("Create Order = %s", orderId));
 		}
 		return orderList;
-	}
-
-
-	private void log(String comment, String... args) {
-		System.out.println(String.format("[%s - %s] %s", LocalDateTime.now(), Thread.currentThread().getName(), String.format(comment, args)));
 	}
 
 	private void log(String comment) {
